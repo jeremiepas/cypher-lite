@@ -6,5 +6,7 @@ breaks, `C` when something is added and `D` for a fix.
 
 ## Unreleased
 
+## 0.1.0.0 — 2026-11-25
+
 - First version: the AST and the parser of a subset of openCypher (MATCH, WHERE, RETURN, and the
   write clauses CREATE, MERGE, SET, REMOVE, DELETE and DETACH DELETE).
