@@ -1,0 +1,788 @@
+-- | Parser for a subset of openCypher: read queries (MATCH, WHERE, RETURN) and
+-- write statements (CREATE, MERGE, SET, REMOVE, DELETE, DETACH DELETE).
+--
+-- Grammar sketch:
+--
+--   statement    := readQuery | mutStatement
+--   readQuery    := MATCH patternList [WHERE predicate] RETURN returnClause
+--   mutStatement := [MATCH patternList [WHERE predicate]]
+--                   ( create | merge | set | remove | delete )+
+--                   [RETURN returnClause]
+--   returnClause := [DISTINCT] returnItems [ORDER BY orderItems] [SKIP n] [LIMIT n]
+--
+-- Keywords are case-insensitive. Anything outside the subset is a parse error
+-- with a position, not a silent fallback.
+--
+-- The parser is mode-free: write clauses parse into 'CypherStatement.MutStatement'
+-- and are permitted or rejected by the caller. Read-only surfaces reject a
+-- 'CypherStatement.MutStatement'.
+module Cypher.Lite.Parser
+  ( parseQuery
+  , parseStatement
+  ) where
+
+import Control.Applicative (optional, (<|>))
+import Control.Monad (unless, void, when)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Text (Text)
+import qualified Data.Text as T
+import Data.Maybe (fromMaybe)
+import Data.Void (Void)
+
+import Text.Megaparsec
+  ( Parsec
+  , MonadParsec (..)
+  , parse
+  , satisfy
+  , oneOf
+  , (<?>)
+  , sepBy1
+  , many
+  , some
+  , sepBy
+  , lookAhead
+  , notFollowedBy
+  )
+import Text.Megaparsec.Char (char, space)
+import Text.Megaparsec.Error (errorBundlePretty)
+
+import Cypher.Lite.AST
+
+-- ───────────────────────────────────────────────
+-- Entry point
+-- ───────────────────────────────────────────────
+
+type Parser = Parsec Void Text
+
+-- | Parse a read query. A mutation statement is a parse error here; use
+-- 'parseStatement' to accept both.
+parseQuery :: Text -> Either Text CypherQuery
+parseQuery input =
+  case parse (readQueryP <?> "query") "query" input of
+    Left bundle  -> Left (T.pack (errorBundlePretty bundle))
+    Right q      -> Right q
+
+-- | Parse a full statement: a read query or a mutation. The parser is
+-- mode-free; callers decide whether a 'CypherStatement.MutStatement' is
+-- permitted.
+parseStatement :: Text -> Either Text CypherStatement
+parseStatement input =
+  case parse (statement <?> "statement") "statement" input of
+    Left bundle  -> Left (T.pack (errorBundlePretty bundle))
+    Right st     -> Right st
+
+-- ───────────────────────────────────────────────
+-- Lexing helpers
+-- ───────────────────────────────────────────────
+
+-- | Skip whitespace (zero or more).
+ws :: Parser ()
+ws = space
+
+isIdentChar :: Char -> Bool
+isIdentChar c = c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+            || c >= '0' && c <= '9'
+
+-- | A case-insensitive keyword. The input must be exactly the keyword
+-- (a maximal identifier run), so @MATCHX@ does not match @MATCH@.
+keyword :: Text -> Parser ()
+keyword k = try $ do
+  r <- takeWhile1P (Just (T.unpack k)) isIdentChar
+  unless (T.toLower r == k) (fail ("unexpected keyword: " ++ T.unpack r))
+
+-- | An identifier: @[a-zA-Z_][a-zA-Z0-9_]*@.
+ident :: Parser Text
+ident = do
+  c <- oneOf ("_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" :: [Char])
+  r <- many (satisfy isIdentChar)
+  pure (T.pack (c : r))
+
+-- | A variable name: an identifier that is not a reserved word.
+varName :: Parser Text
+varName = do
+  r <- takeWhile1P (Just "variable") isIdentChar
+  when (T.toLower r `elem` reservedWords) (fail ("reserved word: " ++ T.unpack (T.toLower r)))
+  pure r
+
+reservedWords :: [Text]
+reservedWords =
+  [ "and", "or", "not", "in", "is", "null", "true", "false"
+  , "starts", "with", "contains", "as", "order", "by", "asc", "desc"
+  , "distinct", "skip", "limit", "count", "where", "return", "match"
+  ]
+
+-- | A label / type name (any identifier).
+labelName :: Parser Text
+labelName = takeWhile1P (Just "label") isIdentChar
+
+-- | A single-quoted string literal with '' escape.
+stringLiteral :: Parser Text
+stringLiteral = do
+  void (char '\'')
+  chunks <- many (stringChunk <|> escapedQuote)
+  void (char '\'')
+  pure (T.concat chunks)
+  where
+    escapedQuote :: Parser Text
+    escapedQuote = try $ do
+      void (char '\'')
+      void (char '\'')
+      pure (T.singleton '\'')
+    stringChunk :: Parser Text
+    stringChunk = takeWhile1P (Just "string") (/= '\'')
+
+-- | A number literal (integer or floating point, optional sign).
+number :: Parser Double
+number = do
+  neg <- optional (char '-')
+  ds <- some (oneOf ("0123456789" :: [Char]))
+  frac <- optional (char '.' *> some (oneOf ("0123456789" :: [Char])))
+  let numStr = case frac of
+        Just f  -> ds ++ "." ++ f
+        Nothing -> ds
+  let val = read numStr :: Double
+  pure (if neg == Just '-' then -val else val)
+
+-- | A non-negative integer.
+natural :: Parser Int
+natural = do
+  ds <- some (oneOf ("0123456789" :: [Char]))
+  pure (read ds)
+
+-- | Error message for a rejected named-path assignment.
+namedPathErrorMsg :: Text
+namedPathErrorMsg =
+  T.pack "named path variables are not supported in this subset"
+
+-- | Named-path guard: reject @MATCH <ident> = ...@.
+--
+-- Named paths (@MATCH p = (a)-[:R]->(b)@) are out of scope for the read-only
+-- subset. The guard only fires on the canonical @<ident> =@ shape (an
+-- identifier immediately followed by a single =, not @==@) so that other
+-- malformed inputs still surface the ordinary parse error.
+--
+-- Megaparsec restores the cursor on failure, so wrapping the guarded peek
+-- in `optional` guarantees real patterns (which begin with @(@) are never
+-- consumed: when the input is not a named path the inner parser fails and
+-- the cursor is rolled back before `patternList` runs.
+rejectNamedPath :: Parser ()
+rejectNamedPath = do
+  np <- (True <$ lookAhead (ident *> ws *> singleEq)) <|> pure False
+  when np (fail (T.unpack namedPathErrorMsg))
+  pure ()
+  where
+    singleEq = char '=' *> notFollowedBy (char '=')
+
+-- ───────────────────────────────────────────────
+-- Query
+-- ───────────────────────────────────────────────
+
+-- | A MATCH/RETURN read query.
+readQueryP :: Parser CypherQuery
+readQueryP = do
+  ws
+  keyword "match"
+  ws
+  rejectNamedPath
+  pats <- patternList
+  ws
+  wh <- optional $ do
+    try (keyword "where")
+    ws
+    p <- predicate
+    ws
+    pure p
+  keyword "return"
+  ws
+  rc <- returnClause
+  ws
+  eof
+  pure (CypherQuery pats wh rc)
+
+-- | A full statement: read query or mutation.
+statement :: Parser CypherStatement
+statement = do
+  ws
+  st <- try (ReadStatement <$> readQueryBody) <|> mutStatement
+  ws
+  eof
+  pure st
+
+-- | A read query body (shared by 'readQueryP' and 'statement').
+readQueryBody :: Parser CypherQuery
+readQueryBody = do
+  keyword "match"
+  ws
+  rejectNamedPath
+  pats <- patternList
+  ws
+  wh <- optional $ do
+    try (keyword "where")
+    ws
+    p <- predicate
+    ws
+    pure p
+  keyword "return"
+  ws
+  rc <- returnClause
+  ws
+  pure (CypherQuery pats wh rc)
+
+-- | A mutation statement: optional MATCH prefix, one or more write
+-- operations, optional trailing RETURN.
+mutStatement :: Parser CypherStatement
+mutStatement = do
+  mPrefix <- optional $ do
+    try (keyword "match" *> ws *> rejectNamedPath)
+    pats <- patternList
+    ws
+    wh <- optional $ do
+      try (keyword "where")
+      ws
+      p <- predicate
+      ws
+      pure p
+    pure (CypherQuery pats wh emptyReturn)
+  ops <- some mutOp
+  ws
+  mrc <- optional $ do
+    try (keyword "return")
+    ws
+    rc <- returnClause
+    ws
+    pure rc
+  pure (MutStatement (Mut mPrefix ops mrc))
+  where
+    emptyReturn = ReturnClause False [RIExpr ENull Nothing] [] Nothing Nothing
+
+-- | One write operation.
+mutOp :: Parser MutOp
+mutOp =
+      createOp
+  <|> mergeOp
+  <|> setOp
+  <|> removeOp
+  <|> deleteOp
+
+createOp :: Parser MutOp
+createOp = do
+  keyword "create"
+  ws
+  pats <- patternList
+  ws
+  mapM_ checkWriteRelTypes pats
+  pure (MCreate pats)
+
+mergeOp :: Parser MutOp
+mergeOp = do
+  keyword "merge"
+  ws
+  pats <- patternList
+  case pats of
+    [single] -> do
+      ws
+      ons <- many onClause
+      ws
+      checkWriteRelTypes single
+      pure (MMerge single ons)
+    _ -> fail "MERGE supports a single node or relationship pattern"
+
+-- | @SET item, item, ...@.
+setOp :: Parser MutOp
+setOp = do
+  keyword "set"
+  ws
+  items <- setItems
+  ws
+  pure (MSet items)
+
+-- | @ON CREATE SET ...@ or @ON MATCH SET ...@ after a MERGE.
+onClause :: Parser OnClause
+onClause = try $ do
+  keyword "on"
+  ws
+  onCreate <- try (keyword "create" *> pure True) <|> (keyword "match" *> pure False)
+  ws
+  keyword "set"
+  ws
+  items <- setItems
+  ws
+  pure (if onCreate then OnCreate items else OnMatch items)
+
+-- | In write patterns, relationship types must name a supported relation from
+-- the closed 'relationVocabulary'; unknown types are a parse error naming the
+-- type and the supported list. Matching is case-insensitive, so both "Calls"
+-- and "calls" resolve.
+checkWriteRelTypes :: PatternElem -> Parser ()
+checkWriteRelTypes (RelPatE rp) =
+  case [t | t <- rpTypes rp, not (T.toLower t `elem` relationVocabulary)] of
+    []    -> pure ()
+    (t:_) -> fail
+      (  "unknown relationship type: " ++ T.unpack t
+      ++ " (supported: " ++ T.unpack (T.intercalate ", " relationVocabulary) ++ ")" )
+checkWriteRelTypes (NodePatE _) = pure ()
+
+-- | The closed vocabulary of relationship types accepted by write clauses.
+--
+-- This mirrors the graph domain's relation enum and is kept here so the parser
+-- stays self-contained and free of a dependency on the graph types. Write
+-- patterns must name a relation from this list (compared case-insensitively);
+-- anything else is a parse error.
+relationVocabulary :: [Text]
+relationVocabulary =
+  [ "calls", "imports", "extends", "implements"
+  , "references", "contains", "depends_on", "inferred"
+  ]
+
+-- | SET items: @var.prop = expr@ or @var:Label@, comma-separated.
+setItems :: Parser [SetItem]
+setItems = sepBy1 setItem (try (ws *> char ',' <* ws))
+
+setItem :: Parser SetItem
+setItem =
+      try (do
+        v <- varName
+        ws
+        void (char ':')
+        ws
+        l <- labelName
+        pure (SetLabel v l))
+  <|> do
+        v <- varName
+        ws
+        void (char '.')
+        ws
+        p <- ident
+        ws
+        void (char '=')
+        -- Reject '+=' (map merge) explicitly: outside the subset.
+        plus <- optional (char '+')
+        case plus of
+          Just _  -> fail "SET var += {...} is outside the supported subset"
+          Nothing -> pure ()
+        ws
+        e <- expr
+        pure (SetProp v p e)
+
+removeOp :: Parser MutOp
+removeOp = do
+  keyword "remove"
+  ws
+  items <- sepBy1 removeItem (try (ws *> char ',' <* ws))
+  ws
+  pure (MRemove items)
+
+removeItem :: Parser RemoveItem
+removeItem =
+      try (do
+        v <- varName
+        ws
+        void (char ':')
+        ws
+        l <- labelName
+        pure (RemoveLabel v l))
+  <|> do
+        v <- varName
+        ws
+        void (char '.')
+        ws
+        p <- ident
+        pure (RemoveProp v p)
+
+deleteOp :: Parser MutOp
+deleteOp = do
+  detach <- (try (keyword "detach" *> ws *> pure True) <|> pure False)
+  keyword "delete"
+  ws
+  vs <- sepBy1 varName (try (ws *> char ',' <* ws))
+  ws
+  pure (MDelete detach vs)
+
+-- ───────────────────────────────────────────────
+-- Patterns
+-- ───────────────────────────────────────────────
+
+patternList :: Parser [PatternElem]
+patternList = do
+  xs <- sepBy1 patternElem (try (ws *> char ',' <* ws))
+  pure (concat xs)
+
+-- | A pattern element: a node pattern optionally followed by a chain of
+-- relationship patterns, each introducing a new node.
+--
+--   (a)-[:R]->(b)-[:S]->(c)
+--     => [NodePatE a, RelPatE (a-b), NodePatE b, RelPatE (b-c), NodePatE c]
+patternElem :: Parser [PatternElem]
+patternElem = do
+  np <- nodePat
+  chain np
+
+chain :: NodePat -> Parser [PatternElem]
+chain cur = do
+  r <- try (relPatChain cur)
+  case r of
+    Just (rel, nextNode) -> do
+      rest <- chain nextNode
+      pure (NodePatE cur : RelPatE rel : rest)
+    Nothing -> pure [NodePatE cur]
+
+nodePat :: Parser NodePat
+nodePat = do
+  void (char '(')
+  ws
+  np <- nodePatInner
+  ws
+  void (char ')')
+  pure np
+
+nodePatInner :: Parser NodePat
+nodePatInner = do
+  v <- optional (varName <* ws)
+  labels <- many (char ':' *> ws *> labelName <* ws)
+  props <- optional $ do
+    void (char '{')
+    ws
+    ps <- propsMap
+    ws
+    void (char '}')
+    pure ps
+  pure (NodePat (fromMaybe "#anon" v) labels (fromMaybe Map.empty props))
+
+-- | Parse a relationship pattern following the source node @cur@.
+-- Consumes @- [ ... ] dir ( target )@ and returns the relationship plus
+-- the target node pattern.
+relPatChain :: NodePat -> Parser (Maybe (RelPat, NodePat))
+relPatChain cur = optional $ do
+  leftArrow <- try (char '<' *> pure True) <|> pure False
+  void (char '-')
+  ws
+  (rVar, rTypes, rHops, rProps) <- relInner
+  void (char '-')
+  rightArrow <- try (char '>' *> pure True) <|> pure False
+  ws
+  void (char '(')
+  ws
+  tp <- nodePatInner
+  ws
+  void (char ')')
+  let dir = if leftArrow then DirLeft
+            else if rightArrow then DirRight
+            else DirUndirected
+  let rel = RelPat
+        { rpFrom  = npVar cur
+        , rpTo    = npVar tp
+        , rpVar   = rVar
+        , rpTypes = rTypes
+        , rpDir   = dir
+        , rpHops  = rHops
+        , rpProps = rProps
+        }
+  pure (rel, tp)
+
+-- | The bracketed relationship body: @[var [:types] [*hops] {props}]@.
+relInner :: Parser (Maybe Text, [Text], HopRange, Map Text Expr)
+relInner = do
+  void (char '[')
+  ws
+  v <- optional (varName <* ws)
+  t <- optional $ do
+    void (char ':')
+    ws
+    ts <- some (labelName <* ws)
+    pure ts
+  h <- optional $ do
+    void (char '*')
+    ws
+    lo <- optional (natural <* ws)
+    hi <- optional $ do
+      void (char '.')
+      void (char '.')
+      ws
+      n <- natural
+      ws
+      pure n
+    let minH = fromMaybe 1 lo
+    let maxH = fromMaybe minH hi
+    pure (HopRange minH maxH)
+  p <- optional $ do
+    void (char '{')
+    ws
+    ps <- propsMap
+    ws
+    void (char '}')
+    pure ps
+  ws
+  void (char ']')
+  pure (v, fromMaybe [] t, fromMaybe (HopRange 1 1) h, fromMaybe Map.empty p)
+
+
+propsMap :: Parser (Map Text Expr)
+propsMap = do
+  pairs <- sepBy propEntry (ws *> char ',' <* ws)
+  pure (Map.fromList pairs)
+
+propEntry :: Parser (Text, Expr)
+propEntry = do
+  k <- ident
+  ws
+  void (char ':')
+  ws
+  v <- expr
+  ws
+  pure (k, v)
+
+-- ───────────────────────────────────────────────
+-- Predicates
+-- ───────────────────────────────────────────────
+
+predicate :: Parser Predicate
+predicate = orExpr
+
+orExpr :: Parser Predicate
+orExpr = do
+  a <- andExpr
+  rest <- many $ do
+    keyword "or"
+    ws
+    b <- andExpr
+    pure b
+  pure (foldl POr a rest)
+
+andExpr :: Parser Predicate
+andExpr = do
+  a <- notExpr
+  rest <- many $ do
+    keyword "and"
+    ws
+    b <- notExpr
+    pure b
+  pure (foldl PAnd a rest)
+
+notExpr :: Parser Predicate
+notExpr =
+    do
+      keyword "not"
+      ws
+      p <- notExpr
+      pure (PNot p)
+  <|> primary
+
+primary :: Parser Predicate
+primary =
+    do
+      void (char '(')
+      ws
+      p <- predicate
+      ws
+      void (char ')')
+      pure p
+  <|> comparison
+
+-- | Local dispatch: the six CompareOps plus the special operators.
+data Op
+  = OpCmp CompareOp
+  | OpRegex
+  | OpIn
+  | OpIs
+  | OpStartsWith
+  | OpContains
+
+opParser :: Parser Op
+opParser =
+    try (char '=' *> char '~' *> pure OpRegex)
+ <|> try (char '<' *> char '>' *> pure (OpCmp OpNeq))
+ <|> try (char '<' *> char '=' *> pure (OpCmp OpLe))
+ <|> try (char '>' *> char '=' *> pure (OpCmp OpGe))
+ <|> (char '=' *> pure (OpCmp OpEq))
+ <|> (char '<' *> pure (OpCmp OpLt))
+ <|> (char '>' *> pure (OpCmp OpGt))
+ <|> (keyword "in" *> ws *> pure OpIn)
+ <|> (keyword "is" *> ws *> pure OpIs)
+ <|> (keyword "starts" *> ws *> keyword "with" *> ws *> pure OpStartsWith)
+ <|> (keyword "contains" *> ws *> pure OpContains)
+
+-- | A single comparison / membership / string / regex predicate.
+comparison :: Parser Predicate
+comparison = do
+  ref <- propRef
+  ws
+  op <- opParser
+  case op of
+    OpCmp c -> do
+      ws
+      e <- expr
+      ws
+      pure (PCompare ref c e)
+    OpRegex -> do
+      ws
+      e <- expr
+      ws
+      pure (PRegex ref e)
+    OpIn -> do
+      ws
+      vals <- char '(' *> ws *> sepBy1 expr (ws *> char ',' <* ws) <* ws <* char ')'
+      ws
+      pure (PIn ref vals)
+    OpIs -> do
+      ws
+      neg <- (try $ do
+        keyword "not"
+        ws
+        pure True
+        ) <|> pure False
+      keyword "null"
+      ws
+      pure (PIsNull ref (not neg))
+    OpStartsWith -> do
+      ws
+      e <- expr
+      ws
+      pure (PStartsWith ref e)
+    OpContains -> do
+      ws
+      e <- expr
+      ws
+      pure (PContains ref e)
+
+-- ───────────────────────────────────────────────
+-- Expressions
+-- ───────────────────────────────────────────────
+
+expr :: Parser Expr
+expr =
+  countExpr
+    <|> literal
+    <|> propRefExpr
+
+countExpr :: Parser Expr
+countExpr = do
+  keyword "count"
+  ws
+  void (char '(')
+  ws
+  arg <- try (char '*' *> pure Nothing)
+       <|> (Just <$> varName)
+  ws
+  void (char ')')
+  pure (ECount arg)
+
+literal :: Parser Expr
+literal =
+    do
+      keyword "true"
+      pure (EBool True)
+  <|> do
+      keyword "false"
+      pure (EBool False)
+  <|> do
+      keyword "null"
+      pure ENull
+  <|> (EStr <$> stringLiteral)
+  <|> (ENum <$> number)
+
+propRefExpr :: Parser Expr
+propRefExpr = do
+  r <- propRef
+  case r of
+    VarRef v    -> pure (EVar v)
+    PropRef v p -> pure (EProp v p)
+
+propRef :: Parser PropRef
+propRef = do
+  v <- varName
+  ws
+  p <- optional (char '.' *> ws *> ident)
+  case p of
+    Just p' -> pure (PropRef v p')
+    Nothing -> pure (VarRef v)
+
+-- ───────────────────────────────────────────────
+-- Return
+-- ───────────────────────────────────────────────
+
+distinctParser :: Parser Bool
+distinctParser =
+  let distinctYes = do
+        keyword "distinct"
+        ws
+        pure True
+  in try distinctYes <|> pure False
+
+returnClause :: Parser ReturnClause
+returnClause = do
+  distinct <- distinctParser
+  items <- returnItems
+  orderBy <- optional $ do
+    keyword "order"
+    ws
+    keyword "by"
+    ws
+    os <- orderItems
+    ws
+    pure os
+  skip <- optional $ do
+    keyword "skip"
+    ws
+    n <- natural
+    ws
+    pure n
+  limit <- optional $ do
+    keyword "limit"
+    ws
+    n <- natural
+    ws
+    pure n
+  pure (ReturnClause distinct items (fromMaybe [] orderBy) skip limit)
+
+returnItems :: Parser [ReturnItem]
+returnItems = sepBy1 returnItem (ws *> char ',' <* ws)
+
+returnItem :: Parser ReturnItem
+returnItem =
+    do
+      keyword "count"
+      ws
+      void (char '(')
+      ws
+      arg <- try (char '*' *> pure Nothing)
+           <|> (Just <$> varName)
+      ws
+      void (char ')')
+      ws
+      alias <- optional $ do
+        keyword "as"
+        ws
+        n <- ident
+        ws
+        pure n
+      pure (RICount arg alias)
+  <|> do
+      e <- expr
+      ws
+      alias <- optional $ do
+        keyword "as"
+        ws
+        n <- ident
+        ws
+        pure n
+      ws
+      pure (RIExpr e alias)
+
+orderItems :: Parser [OrderItem]
+orderItems = sepBy1 orderItem (ws *> char ',' <* ws)
+
+orderItem :: Parser OrderItem
+orderItem = do
+  r <- propRef
+  ws
+  desc <- (try $ do
+    keyword "desc"
+    ws
+    pure True
+    ) <|> (do
+    keyword "asc"
+    ws
+    pure False
+    ) <|> pure False
+  pure (OrderItem r desc)

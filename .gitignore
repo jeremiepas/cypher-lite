@@ -1,0 +1,11 @@
+# toolchain and build outputs
+.devenv/
+.devenv.flake.nix
+.direnv/
+dist-newstyle/
+dist-docs/
+dist-sdist/
+dist-release/
+cabal.project.local
+cabal.project.local~
+.ghc.environment.*

@@ -1,0 +1,58 @@
+cabal-version:      3.0
+name:               cypher-lite
+-- Package Versioning Policy (https://pvp.haskell.org): A.B.C.D. A.B changes when the API breaks,
+-- C when something is added, D for a fix. The released version equals the tag without its `v`.
+version:            0.1.0.0
+synopsis:           A parser for a subset of openCypher: MATCH, WHERE, RETURN and the write clauses
+description:
+  A parser for a subset of openCypher: MATCH, WHERE, RETURN and the write clauses.
+  .
+  See the README at <https://github.com/jeremiepas/cypher-lite#readme> for an introduction.
+homepage:           https://github.com/jeremiepas/cypher-lite
+bug-reports:        https://github.com/jeremiepas/cypher-lite/issues
+license:            MIT
+license-file:       LICENSE
+author:             jeremie de pas
+maintainer:         jeremiepas@users.noreply.github.com
+copyright:          2026 jeremie de pas
+category:           Database
+build-type:         Simple
+tested-with:        GHC ==9.8.4 || ==9.10.3 || ==9.12.2
+extra-doc-files:    README.md
+                    CHANGELOG.md
+
+source-repository head
+  type:     git
+  location: https://github.com/jeremiepas/cypher-lite.git
+
+common shared
+  default-language:   GHC2021
+  default-extensions: DerivingStrategies
+                      LambdaCase
+                      OverloadedStrings
+  ghc-options:        -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+                      -Wredundant-constraints -Wmissing-export-lists
+
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:  Cypher.Lite
+                    Cypher.Lite.AST
+                    Cypher.Lite.Parser
+  build-depends:    base >=4.19 && <5
+                  , containers >=0.6 && <0.8
+                  , megaparsec >=9.6 && <10
+                  , text >=2.0 && <2.2
+
+test-suite spec
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Spec.hs
+  other-modules:    Cypher.Lite.ParserSpec
+  ghc-options:      -threaded
+  build-depends:    base >=4.19 && <5
+                  , containers >=0.6 && <0.8
+                  , cypher-lite
+                  , hspec >=2.10 && <3
+                  , text >=2.0 && <2.2

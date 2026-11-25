@@ -1,0 +1,29 @@
+name: Bug report
+description: Something does not behave as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: A short program that shows the problem helps most.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version of cypher-lite
+      placeholder: 0.1.0.0
+    validations:
+      required: true
+  - type: input
+    id: ghc
+    attributes:
+      label: GHC and operating system
+      placeholder: GHC 9.10.3, Ubuntu 24.04

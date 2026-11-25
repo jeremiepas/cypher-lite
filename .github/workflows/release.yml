@@ -1,0 +1,150 @@
+# A release has two moments.
+#
+#   1. Pushing the tag v<version> builds the release with devenv, creates the GitHub release with
+#      the source tarball, and uploads that tarball to Hackage as a *candidate*: visible at
+#      https://hackage.haskell.org/package/<name>-<version>/candidate, not yet published.
+#   2. Running this workflow by hand with the version publishes the tarball of the GitHub release
+#      to Hackage. A version published on Hackage can never be replaced: this is why it is a
+#      separate, deliberate step.
+#
+# The Hackage token is the secret HACKAGE_TOKEN of the environment `hackage`. Without it the tag
+# still gives a GitHub release, and the Hackage steps say they were skipped.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to publish on Hackage, without the v (its GitHub release must exist)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: GitHub release and Hackage candidate
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: hackage
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag against the cabal file, the changelog and main
+        id: meta
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="$(sed -n 's/^name:[[:space:]]*//p' ./*.cabal)"
+          declared="$(sed -n 's/^version:[[:space:]]*//p' ./*.cabal)"
+          if [ "${declared}" != "${version}" ]; then
+            echo "::error::the tag is ${GITHUB_REF_NAME} and the cabal file says version ${declared}"
+            exit 1
+          fi
+          awk -v v="${version}" '
+            $1 == "##" && $2 == v { on = 1; next }
+            $1 == "##" { on = 0 }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md has no section \"## ${version}\" with something in it"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::the tagged commit is not on main"
+            exit 1
+          fi
+          echo "name=${name}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
+
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: devenv
+
+      - name: Install devenv (nixpkgs revision of devenv.lock)
+        run: |
+          rev=$(jq -r '.nodes.nixpkgs.locked.rev' devenv.lock)
+          nix profile add "github:NixOS/nixpkgs/${rev}#devenv" \
+            || nix profile add "github:cachix/devenv-nixpkgs/${rev}#devenv"
+
+      - name: Update the package index
+        run: devenv shell -- cabal update
+
+      - name: Build, test, cabal check, docs, build from the source tarball
+        run: devenv shell -- lib-ci
+
+      - name: Build the files of the release
+        run: devenv shell -- lib-dist
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist-release/*.tar.gz \
+            --title "${{ steps.meta.outputs.name }} ${{ steps.meta.outputs.version }}" \
+            --notes-file release-notes.md --verify-tag
+
+      - name: Upload the candidate to Hackage
+        env:
+          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
+        run: |
+          if [ -z "${HACKAGE_TOKEN}" ]; then
+            echo "::warning::no HACKAGE_TOKEN in the environment hackage: the Hackage candidate was skipped"
+            exit 0
+          fi
+          sdist="dist-release/${{ steps.meta.outputs.name }}-${{ steps.meta.outputs.version }}.tar.gz"
+          docs="dist-release/${{ steps.meta.outputs.name }}-${{ steps.meta.outputs.version }}-docs.tar.gz"
+          devenv shell -- cabal upload --token="${HACKAGE_TOKEN}" "${sdist}"
+          devenv shell -- cabal upload --token="${HACKAGE_TOKEN}" --documentation "${docs}"
+
+  publish:
+    name: Publish on Hackage
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: hackage
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download the files of the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "${VERSION}" in
+            *[!0-9.]* | '') echo "::error::\"${VERSION}\" is not a version"; exit 1 ;;
+          esac
+          mkdir dist-release
+          gh release download "v${VERSION}" --dir dist-release --pattern '*.tar.gz'
+          ls -l dist-release
+
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
+
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: devenv
+
+      - name: Install devenv (nixpkgs revision of devenv.lock)
+        run: |
+          rev=$(jq -r '.nodes.nixpkgs.locked.rev' devenv.lock)
+          nix profile add "github:NixOS/nixpkgs/${rev}#devenv" \
+            || nix profile add "github:cachix/devenv-nixpkgs/${rev}#devenv"
+
+      - name: Publish the tarball of the release, then its documentation
+        env:
+          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -z "${HACKAGE_TOKEN}" ]; then
+            echo "::error::no HACKAGE_TOKEN in the environment hackage"
+            exit 1
+          fi
+          name="$(sed -n 's/^name:[[:space:]]*//p' ./*.cabal)"
+          devenv shell -- cabal upload --publish --token="${HACKAGE_TOKEN}" "dist-release/${name}-${VERSION}.tar.gz"
+          devenv shell -- cabal upload --publish --token="${HACKAGE_TOKEN}" --documentation "dist-release/${name}-${VERSION}-docs.tar.gz"

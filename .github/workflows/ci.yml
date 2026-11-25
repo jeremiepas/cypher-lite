@@ -1,0 +1,82 @@
+# Actions are pinned to full commit SHAs and the token is read-only.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The reference build: the pinned compiler of devenv.nix, the same commands as on a laptop.
+  verify:
+    name: verify (devenv)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
+
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: devenv
+
+      - name: Install devenv (nixpkgs revision of devenv.lock)
+        run: |
+          rev=$(jq -r '.nodes.nixpkgs.locked.rev' devenv.lock)
+          nix profile add "github:NixOS/nixpkgs/${rev}#devenv" \
+            || nix profile add "github:cachix/devenv-nixpkgs/${rev}#devenv"
+
+      - name: Restore the cabal store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.local/state/cabal/store
+            ~/.local/state/cabal/packages
+            ~/.cache/cabal/packages
+            ~/.cabal/store
+            ~/.cabal/packages
+          key: cabal-${{ runner.os }}-devenv-${{ hashFiles('*.cabal', 'cabal.project', 'devenv.lock') }}
+          restore-keys: |
+            cabal-${{ runner.os }}-devenv-
+
+      - name: Update the package index
+        run: devenv shell -- cabal update
+
+      - name: Build, test, cabal check, docs, build from the source tarball
+        run: devenv shell -- lib-ci
+
+  # The other compilers of `tested-with`. GHC 9.10 is the one of the devenv job.
+  compat:
+    name: GHC ${{ matrix.ghc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc: ['9.8', '9.12']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2
+        id: setup
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: latest
+
+      - name: Restore the cabal store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-${{ runner.os }}-ghc${{ matrix.ghc }}-${{ hashFiles('*.cabal', 'cabal.project') }}
+          restore-keys: |
+            cabal-${{ runner.os }}-ghc${{ matrix.ghc }}-
+
+      - run: cabal update
+      - run: cabal build all --enable-tests
+      - run: cabal test all --enable-tests --test-show-details=direct
