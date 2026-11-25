@@ -34,7 +34,7 @@ jobs:
             || nix profile add "github:cachix/devenv-nixpkgs/${rev}#devenv"
 
       - name: Restore the cabal store
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.local/state/cabal/store
@@ -70,7 +70,7 @@ jobs:
           cabal-version: latest
 
       - name: Restore the cabal store
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-${{ runner.os }}-ghc${{ matrix.ghc }}-${{ hashFiles('*.cabal', 'cabal.project') }}
